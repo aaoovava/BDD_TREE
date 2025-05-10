@@ -483,26 +483,196 @@ BDD* BDD_create_with_best_order(const char *dnf) {
     return best_bdd;
 }
 
+// Function to generate a random DNF expression
+char* generate_random_dnf(int var_count, int term_count) {
+    char* vars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    char* dnf = malloc(1000 * sizeof(char));
+    dnf[0] = '\0';
+    
+    for (int t = 0; t < term_count; t++) {
+        int vars_in_term = 1 + rand() % var_count;
+        bool used_vars[26] = {false};
+        
+        for (int v = 0; v < vars_in_term; v++) {
+            int var_idx;
+            do {
+                var_idx = rand() % var_count;
+            } while (used_vars[var_idx]);
+            used_vars[var_idx] = true;
+            
+            // Randomly negate
+            if (rand() % 2) {
+                strcat(dnf, "!");
+            }
+            
+            // Add variable
+            char var_str[2] = {vars[var_idx], '\0'};
+            strcat(dnf, var_str);
+        }
+        
+        if (t < term_count - 1) {
+            strcat(dnf, "+");
+        }
+    }
+    
+    return dnf;
+}
+
+// Function to evaluate a DNF expression directly
+char evaluate_dnf(const char* dnf, const char* inputs) {
+    // Make a copy we can modify
+    char* expr = strdup(dnf);
+    char* term = strtok(expr, "+");
+    
+    while (term != NULL) {
+        bool term_true = true;
+        char* p = term;
+        
+        while (*p) {
+            bool negated = false;
+            if (*p == '!') {
+                negated = true;
+                p++;
+            }
+            
+            if (isalpha(*p)) {
+                int var_idx = toupper(*p) - 'A';
+                bool var_value = (inputs[var_idx] == '1');
+                
+                if (negated) {
+                    var_value = !var_value;
+                }
+                
+                if (!var_value) {
+                    term_true = false;
+                    break;
+                }
+            }
+            
+            p++;
+        }
+        
+        if (term_true) {
+            free(expr);
+            return '1';
+        }
+        
+        term = strtok(NULL, "+");
+    }
+    
+    free(expr);
+    return '0';
+}
+
+// Function to generate all possible input combinations
+void test_all_combinations(BDD* bdd, const char* dnf, int var_count) {
+    printf("Testing all combinations for DNF: %s\n", dnf);
+    
+    char* inputs = malloc((var_count + 1) * sizeof(char));
+    inputs[var_count] = '\0';
+    
+    int total_tests = 1 << var_count;
+    int passed = 0;
+    
+    for (int i = 0; i < total_tests; i++) {
+        // Generate binary string
+        for (int j = 0; j < var_count; j++) {
+            inputs[j] = (i & (1 << (var_count - j - 1))) ? '1' : '0';
+        }
+        
+        char expected = evaluate_dnf(dnf, inputs);
+        char actual = BDD_use(bdd, inputs);
+        
+        if (expected != actual) {
+            printf("Test failed for inputs %s: expected %c, got %c\n", 
+                  inputs, expected, actual);
+        } else {
+            passed++;
+        }
+    }
+    
+    printf("Passed %d/%d tests (%.2f%%)\n\n", passed, total_tests, 
+          (float)passed/total_tests*100);
+    free(inputs);
+}
+
+// Function to test BDD creation and measure reduction
+void test_bdd_creation(const char* dnf, const char* order) {
+    printf("Testing BDD creation for DNF: %s\n", dnf);
+    printf("Using order: %s\n", order);
+    
+    clock_t start = clock();
+    BDD* bdd = BDD_create(dnf, order);
+    clock_t end = clock();
+    
+    printf("Creation time: %.2f ms\n", (double)(end - start) * 1000 / CLOCKS_PER_SEC);
+    printf("Node count: %d\n", bdd->node_count);
+    
+    int var_count = strlen(order);
+    test_all_combinations(bdd, dnf, var_count);
+    
+    // Cleanup
+    for (int i = 0; i < bdd->unique.size; i++) 
+        free(bdd->unique.nodes[i]);
+    free(bdd->unique.nodes);
+    free(bdd->var_order);
+    free(bdd);
+}
+
+void test_optimized_bdd(const char* dnf) {
+    printf("Testing optimized BDD creation for DNF: %s\n", dnf);
+    
+    clock_t start = clock();
+    BDD* bdd = BDD_create_with_best_order(dnf);
+    clock_t end = clock();
+    
+    printf("Optimization time: %.2f ms\n", (double)(end - start) * 1000 / CLOCKS_PER_SEC);
+    printf("Optimal order: %s\n", bdd->var_order);
+    printf("Node count: %d\n", bdd->node_count);
+    
+    int var_count = strlen(bdd->var_order);
+    test_all_combinations(bdd, dnf, var_count);
+    
+    // Cleanup
+    for (int i = 0; i < bdd->unique.size; i++) 
+        free(bdd->unique.nodes[i]);
+    free(bdd->unique.nodes);
+    free(bdd->var_order);
+    free(bdd);
+}
+
 
 // -------------------- Main --------------------
 int main() {
-    const char *complex_dnf = "AB + AC + BC";
+    srand(time(NULL));
     
-    BDD *optimized_bdd = BDD_create_with_best_order(complex_dnf);
+    // Simple test cases
+    test_bdd_creation("AB+!AC", "ABC");
+    test_bdd_creation("A+B+C", "ABC");
+    test_bdd_creation("A!B+!AB", "AB");
     
-    printf("Optimal order: %s\n", optimized_bdd->var_order);
-    printf("Node count: %d\n", optimized_bdd->node_count);
+    // Test optimized creation
+    test_optimized_bdd("AB+!AC");
+    test_optimized_bdd("A!B!C+!AB!C+!A!BC");
     
-    // Test evaluation
-    printf("%c\n", BDD_use(optimized_bdd, "00000000000000")); // All false
-    printf("%c\n", BDD_use(optimized_bdd, "11111111111111")); // All true
-    
-    // Cleanup
-    for (int i = 0; i < optimized_bdd->unique.size; i++) 
-        free(optimized_bdd->unique.nodes[i]);
-    free(optimized_bdd->unique.nodes);
-    free(optimized_bdd->var_order);
-    free(optimized_bdd);
+    // Generate and test random DNFs
+    for (int i = 0; i < 5; i++) {
+        int var_count = 4 + rand() % 5; // 4-8 variables
+        int term_count = 3 + rand() % 5; // 3-7 terms
+        
+        char* dnf = generate_random_dnf(var_count, term_count);
+        
+        // Create default order (alphabetical)
+        char order[27] = {0};
+        for (int j = 0; j < var_count; j++) {
+            order[j] = 'A' + j;
+        }
+        
+        test_bdd_creation(dnf, order);
+        test_optimized_bdd(dnf);
+        
+        free(dnf);
+    }
     
     return 0;
 }
