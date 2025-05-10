@@ -3,18 +3,21 @@
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <time.h>
+
+#define INT_MAX 2147483647
 
 // -------------------- Data Structures --------------------
 typedef struct BDDNode
 {
     char var_name;
     int var_index;
-    struct BDDNode *parent;
     struct BDDNode *high;
     struct BDDNode *low;
     int id;
     bool is_terminal;
     char value;
+    bool visited;
 } BDDNode;
 
 typedef struct
@@ -189,27 +192,317 @@ void print_term(const DNFTerm *term)
     }
 }
 
-// -------------------- Main --------------------
-int main()
-{
-    const char *dnf = "!AA + !BB + BC!B + C!A";
-    const char *order = "ABC";
-
-    int term_count;
-    DNFTerm *terms = normalize_dnf(dnf, order, &term_count);
-
-    printf("Original DNF: %s\n", dnf);
-    printf("Variable order: %s\n", order);
-    printf("Normalized terms:\n");
-
-    for (int i = 0; i < term_count; i++)
-    {
-        printf("Term %d: ", i + 1);
-        print_term(&terms[i]);
-        printf("\n");
-        free(terms[i].vars);
+// -------------------- BDD Creation --------------------
+BDDNode* create_terminal_node(BDD *bdd, char value) {
+    for (int i = 0; i < bdd->unique.size; i++) {
+        BDDNode *node = bdd->unique.nodes[i];
+        if (node->is_terminal && node->value == value) {
+            return node;
+        }
     }
 
+    BDDNode *node = malloc(sizeof(BDDNode));
+    node->is_terminal = true;
+    node->value = value;
+    node->high = node->low = NULL;
+    node->id = bdd->node_count++;  // Increment count here
+    
+    // Add to unique table
+    if (bdd->unique.size >= bdd->unique.capacity) {
+        bdd->unique.capacity *= 2;
+        bdd->unique.nodes = realloc(bdd->unique.nodes, 
+                                  bdd->unique.capacity * sizeof(BDDNode*));
+    }
+    bdd->unique.nodes[bdd->unique.size++] = node;
+    
+    return node;
+}
+
+void mark_reachable(BDDNode *node) {
+    if (!node || node->visited) return;
+    
+    node->visited = true;
+    
+    if (!node->is_terminal) {
+        mark_reachable(node->high);
+        mark_reachable(node->low);
+    }
+}
+
+void update_node_count(BDD *bdd) {
+    // Reset visited flags
+    for (int i = 0; i < bdd->unique.size; i++) {
+        bdd->unique.nodes[i]->visited = false;
+    }
+    
+    // Mark reachable nodes from root
+    mark_reachable(bdd->root);
+    
+    // Count marked nodes
+    int count = 0;
+    for (int i = 0; i < bdd->unique.size; i++) {
+        if (bdd->unique.nodes[i]->visited) {
+            count++;
+        }
+    }
+    
+    bdd->node_count = count;
+}
+
+BDDNode* find_or_create_node(BDD *bdd, char var_name, int var_index, 
+                           BDDNode *high, BDDNode *low) {
+    // Eliminate redundant nodes (1st reduction)
+    if (high == low) {
+        return high;
+    }
+
+    // Check for existing isomorphic nodes (2nd reduction)
+    for (int i = 0; i < bdd->unique.size; i++) {
+        BDDNode *node = bdd->unique.nodes[i];
+        if (!node->is_terminal &&
+            node->var_name == var_name &&
+            node->var_index == var_index &&
+            node->high == high &&
+            node->low == low) {
+            return node;
+        }
+    }
+
+    // Create new node
+    BDDNode *node = malloc(sizeof(BDDNode));
+    node->var_name = var_name;
+    node->var_index = var_index;
+    node->high = high;
+    node->low = low;
+    node->is_terminal = false;
+    node->id = bdd->node_count++;
+    
+    // Add to unique table
+    if (bdd->unique.size >= bdd->unique.capacity) {
+        bdd->unique.capacity *= 2;
+        bdd->unique.nodes = realloc(bdd->unique.nodes, 
+                                  bdd->unique.capacity * sizeof(BDDNode*));
+    }
+    bdd->unique.nodes[bdd->unique.size++] = node;
+    
+    return node;
+}
+
+BDDNode* build_term_bdd(BDD *bdd, DNFTerm *term, int var_index) {
+    if (var_index >= bdd->var_count) {
+        return create_terminal_node(bdd, '1');
+    }
+
+    char current_var = bdd->var_order[var_index];
+    bool exists = false;
+    bool negated = false;
+
+    // Check if variable exists in term
+    for (int i = 0; i < term->length; i++) {
+        if (term->vars[i].name == current_var) {
+            exists = true;
+            negated = term->vars[i].negated;
+            break;
+        }
+    }
+
+    BDDNode *high, *low;
+    if (exists) {
+        if (negated) {
+            high = create_terminal_node(bdd, '0');
+            low = build_term_bdd(bdd, term, var_index + 1);
+        } else {
+            high = build_term_bdd(bdd, term, var_index + 1);
+            low = create_terminal_node(bdd, '0');
+        }
+    } else {
+        BDDNode *child = build_term_bdd(bdd, term, var_index + 1);
+        high = low = child;
+    }
+
+    return find_or_create_node(bdd, current_var, var_index, high, low);
+}
+
+BDDNode* bdd_or(BDD *bdd, BDDNode *f, BDDNode *g) {
+    if (f->is_terminal) return f->value == '1' ? f : g;
+    if (g->is_terminal) return g->value == '1' ? g : f;
+
+    if (f->var_index < g->var_index) {
+        BDDNode *high = bdd_or(bdd, f->high, g);
+        BDDNode *low = bdd_or(bdd, f->low, g);
+        return find_or_create_node(bdd, f->var_name, f->var_index, high, low);
+    }
+    if (f->var_index > g->var_index) {
+        BDDNode *high = bdd_or(bdd, f, g->high);
+        BDDNode *low = bdd_or(bdd, f, g->low);
+        return find_or_create_node(bdd, g->var_name, g->var_index, high, low);
+    }
+
+    BDDNode *high = bdd_or(bdd, f->high, g->high);
+    BDDNode *low = bdd_or(bdd, f->low, g->low);
+    return find_or_create_node(bdd, f->var_name, f->var_index, high, low);
+}
+
+char BDD_use(BDD *bdd, const char *inputs) {
+    BDDNode *current = bdd->root;
+    
+    while (!current->is_terminal) {
+        char var = current->var_name;
+        int input_index = toupper(var) - 'A';  // Convert variable to 0-based index
+        
+        // Validate input index
+        if (input_index < 0 || input_index >= bdd->var_count) {
+            return -1;  // Error: invalid variable in BDD
+        }
+        
+        // Get the input value (0 or 1)
+        bool value = (inputs[input_index] == '1');
+        
+        // Move to next node
+        current = value ? current->high : current->low;
+        
+        // Handle edge case (shouldn't happen in valid BDDs)
+        if (current == NULL) {
+            return -1;
+        }
+    }
+    
+    return current->value;  // Return terminal value ('0' or '1')
+}
+
+BDD* BDD_create(const char *dnf, const char *var_order) {
+    int term_count;
+    DNFTerm *terms = normalize_dnf(dnf, var_order, &term_count);
+
+    BDD *bdd = malloc(sizeof(BDD));
+    bdd->var_order = strdup(var_order);
+    bdd->var_count = strlen(var_order);
+    
+    // Initialize counts FIRST
+    bdd->node_count = 0;
+    bdd->unique.size = 0;
+    bdd->unique.capacity = 10;
+    bdd->unique.nodes = malloc(10 * sizeof(BDDNode*));
+    
+    // Create terminals first
+    BDDNode *zero = create_terminal_node(bdd, '0');
+    BDDNode *one = create_terminal_node(bdd, '1');
+    
+    BDDNode *result = zero;
+
+    for (int i = 0; i < term_count; i++) {
+        if (terms[i].length == 0) continue;
+        BDDNode *term_bdd = build_term_bdd(bdd, &terms[i], 0);
+        result = bdd_or(bdd, result, term_bdd);
+    }
+
+    bdd->root = result;
+
+    for (int i = 0; i < term_count; i++) free(terms[i].vars);
     free(terms);
+    return bdd;
+}
+
+// Helper function to generate a random permutation of variables
+void shuffle_order(char *order, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        char temp = order[i];
+        order[i] = order[j];
+        order[j] = temp;
+    }
+}
+
+// Helper function to count unique variables in DNF
+int count_unique_vars(const char *dnf) {
+    bool vars[26] = {false};
+    for (const char *p = dnf; *p; p++) {
+        if (isalpha(*p)) {
+            vars[toupper(*p) - 'A'] = true;
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < 26; i++) {
+        if (vars[i]) count++;
+    }
+    return count;
+}
+
+BDD* BDD_create_with_best_order(const char *dnf) {
+    srand(time(NULL)); // Seed random number generator
+    
+    int num_vars = count_unique_vars(dnf);
+    if (num_vars == 0) return NULL;
+    
+    // Create initial order (alphabetical)
+    char base_order[26];
+    int pos = 0;
+    for (int i = 0; i < 26; i++) {
+        if (strchr(dnf, 'A' + i) || strchr(dnf, 'a' + i)) {
+            base_order[pos++] = 'A' + i;
+        }
+    }
+    base_order[pos] = '\0';
+    
+    BDD *best_bdd = NULL;
+    int best_size = INT_MAX;
+    
+    // Try at least N different orders (where N is number of variables)
+    for (int i = 0; i < num_vars * 2; i++) {
+        char current_order[27];
+        strcpy(current_order, base_order);
+        
+        if (i > 0) { // After first try, shuffle the order
+            shuffle_order(current_order, num_vars);
+        }
+        
+        BDD *temp_bdd = BDD_create(dnf, current_order);
+        update_node_count(temp_bdd); // Ensure accurate node count
+        
+        if (!best_bdd || temp_bdd->node_count < best_size) {
+            if (best_bdd) {
+                // Free previous best BDD
+                for (int j = 0; j < best_bdd->unique.size; j++) 
+                    free(best_bdd->unique.nodes[j]);
+                free(best_bdd->unique.nodes);
+                free(best_bdd->var_order);
+                free(best_bdd);
+            }
+            best_bdd = temp_bdd;
+            best_size = temp_bdd->node_count;
+        } else {
+            // Free the temporary BDD
+            for (int j = 0; j < temp_bdd->unique.size; j++) 
+                free(temp_bdd->unique.nodes[j]);
+            free(temp_bdd->unique.nodes);
+            free(temp_bdd->var_order);
+            free(temp_bdd);
+        }
+    }
+    
+    return best_bdd;
+}
+
+
+// -------------------- Main --------------------
+int main() {
+    const char *complex_dnf = "AB + AC + BC";
+    
+    BDD *optimized_bdd = BDD_create_with_best_order(complex_dnf);
+    
+    printf("Optimal order: %s\n", optimized_bdd->var_order);
+    printf("Node count: %d\n", optimized_bdd->node_count);
+    
+    // Test evaluation
+    printf("%c\n", BDD_use(optimized_bdd, "00000000000000")); // All false
+    printf("%c\n", BDD_use(optimized_bdd, "11111111111111")); // All true
+    
+    // Cleanup
+    for (int i = 0; i < optimized_bdd->unique.size; i++) 
+        free(optimized_bdd->unique.nodes[i]);
+    free(optimized_bdd->unique.nodes);
+    free(optimized_bdd->var_order);
+    free(optimized_bdd);
+    
     return 0;
 }
