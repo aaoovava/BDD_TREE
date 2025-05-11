@@ -249,8 +249,7 @@ void update_node_count(BDD *bdd) {
     bdd->node_count = count;
 }
 
-BDDNode* find_or_create_node(BDD *bdd, char var_name, int var_index, 
-                           BDDNode *high, BDDNode *low) {
+BDDNode* find_or_create_node(BDD *bdd, char var_name, int var_index, BDDNode *high, BDDNode *low) {
     // Eliminate redundant nodes (1st reduction)
     if (high == low) {
         return high;
@@ -290,6 +289,7 @@ BDDNode* find_or_create_node(BDD *bdd, char var_name, int var_index,
 
 BDDNode* build_term_bdd(BDD *bdd, DNFTerm *term, int var_index) {
     if (var_index >= bdd->var_count) {
+        // All variables processed - this term is satisfied
         return create_terminal_node(bdd, '1');
     }
 
@@ -309,13 +309,14 @@ BDDNode* build_term_bdd(BDD *bdd, DNFTerm *term, int var_index) {
     BDDNode *high, *low;
     if (exists) {
         if (negated) {
-            high = create_terminal_node(bdd, '0');
-            low = build_term_bdd(bdd, term, var_index + 1);
+            high = create_terminal_node(bdd, '0');  // If negated var is 1, term fails
+            low = build_term_bdd(bdd, term, var_index + 1);  // If 0, continue
         } else {
-            high = build_term_bdd(bdd, term, var_index + 1);
-            low = create_terminal_node(bdd, '0');
+            high = build_term_bdd(bdd, term, var_index + 1);  // If var is 1, continue
+            low = create_terminal_node(bdd, '0');  // If 0, term fails
         }
     } else {
+        // Variable not in term - continue with both branches
         BDDNode *child = build_term_bdd(bdd, term, var_index + 1);
         high = low = child;
     }
@@ -324,50 +325,51 @@ BDDNode* build_term_bdd(BDD *bdd, DNFTerm *term, int var_index) {
 }
 
 BDDNode* bdd_or(BDD *bdd, BDDNode *f, BDDNode *g) {
+    // Terminal cases
     if (f->is_terminal) return f->value == '1' ? f : g;
     if (g->is_terminal) return g->value == '1' ? g : f;
 
+    // Same variable - merge branches
+    if (f->var_index == g->var_index) {
+        BDDNode *high = bdd_or(bdd, f->high, g->high);
+        BDDNode *low = bdd_or(bdd, f->low, g->low);
+        return find_or_create_node(bdd, f->var_name, f->var_index, high, low);
+    }
+
+    // Different variables - f comes first in order
     if (f->var_index < g->var_index) {
         BDDNode *high = bdd_or(bdd, f->high, g);
         BDDNode *low = bdd_or(bdd, f->low, g);
         return find_or_create_node(bdd, f->var_name, f->var_index, high, low);
     }
-    if (f->var_index > g->var_index) {
-        BDDNode *high = bdd_or(bdd, f, g->high);
-        BDDNode *low = bdd_or(bdd, f, g->low);
-        return find_or_create_node(bdd, g->var_name, g->var_index, high, low);
-    }
-
-    BDDNode *high = bdd_or(bdd, f->high, g->high);
-    BDDNode *low = bdd_or(bdd, f->low, g->low);
-    return find_or_create_node(bdd, f->var_name, f->var_index, high, low);
+    
+    // g comes first in order
+    BDDNode *high = bdd_or(bdd, f, g->high);
+    BDDNode *low = bdd_or(bdd, f, g->low);
+    return find_or_create_node(bdd, g->var_name, g->var_index, high, low);
 }
 
+// In BDD_use(), add input validation:
 char BDD_use(BDD *bdd, const char *inputs) {
-    BDDNode *current = bdd->root;
+    if (!bdd || !inputs) return -1;
     
+    BDDNode *current = bdd->root;
     while (!current->is_terminal) {
         char var = current->var_name;
-        int input_index = toupper(var) - 'A';  // Convert variable to 0-based index
+        int input_index = toupper(var) - 'A';
         
-        // Validate input index
-        if (input_index < 0 || input_index >= bdd->var_count) {
-            return -1;  // Error: invalid variable in BDD
-        }
-        
-        // Get the input value (0 or 1)
-        bool value = (inputs[input_index] == '1');
-        
-        // Move to next node
-        current = value ? current->high : current->low;
-        
-        // Handle edge case (shouldn't happen in valid BDDs)
-        if (current == NULL) {
+        if (input_index < 0 || input_index >= 26) {
             return -1;
         }
+        
+        if (inputs[input_index] != '0' && inputs[input_index] != '1') {
+            return -1;
+        }
+        
+        current = (inputs[input_index] == '1') ? current->high : current->low;
     }
     
-    return current->value;  // Return terminal value ('0' or '1')
+    return current->value;
 }
 
 BDD* BDD_create(const char *dnf, const char *var_order) {
@@ -403,7 +405,7 @@ BDD* BDD_create(const char *dnf, const char *var_order) {
     return bdd;
 }
 
-// Helper function to generate a random permutation of variables
+// Helper function to generate a random permutation of variables(Fisher-Yates)
 void shuffle_order(char *order, int n) {
     for (int i = n - 1; i > 0; i--) {
         int j = rand() % (i + 1);
@@ -485,36 +487,64 @@ BDD* BDD_create_with_best_order(const char *dnf) {
 
 // Function to generate a random DNF expression
 char* generate_random_dnf(int var_count, int term_count) {
-    char* vars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     char* dnf = malloc(1000 * sizeof(char));
     dnf[0] = '\0';
+
+    // 1. Гарантируем использование всех переменных
+    int required_terms = (term_count < var_count) ? var_count : term_count;
+    char* vars = malloc(var_count * sizeof(char));
     
-    for (int t = 0; t < term_count; t++) {
-        int vars_in_term = 1 + rand() % var_count;
-        bool used_vars[26] = {false};
-        
-        for (int v = 0; v < vars_in_term; v++) {
-            int var_idx;
-            do {
-                var_idx = rand() % var_count;
-            } while (used_vars[var_idx]);
-            used_vars[var_idx] = true;
-            
-            // Randomly negate
-            if (rand() % 2) {
-                strcat(dnf, "!");
-            }
-            
-            // Add variable
-            char var_str[2] = {vars[var_idx], '\0'};
-            strcat(dnf, var_str);
-        }
-        
-        if (t < term_count - 1) {
-            strcat(dnf, "+");
-        }
+    // Создаем массив переменных и перемешиваем его
+    for (int i = 0; i < var_count; i++) {
+        vars[i] = 'A' + i;
     }
-    
+    for (int i = var_count-1; i > 0; i--) { // Fisher-Yates shuffle
+        int j = rand() % (i+1);
+        char temp = vars[i];
+        vars[i] = vars[j];
+        vars[j] = temp;
+    }
+
+    // 2. Распределяем обязательные переменные
+    int vars_used = 0;
+    for (int t = 0; t < required_terms; t++) {
+        // Добавляем минимум одну новую переменную в каждый из первых var_count термов
+        if (t < var_count && vars_used < var_count) {
+            // Добавляем обязательную переменную
+            if (rand() % 2) strcat(dnf, "!");
+            char var_str[2] = {vars[vars_used++], '\0'};
+            strcat(dnf, var_str);
+            
+            // Добавляем дополнительные переменные в терм
+            int extra_vars = rand() % (var_count - vars_used + 1);
+            for (int e = 0; e < extra_vars; e++) {
+                strcat(dnf, (rand() % 2) ? "!" : "");
+                char extra_str[2] = {vars[rand() % var_count], '\0'};
+                strcat(dnf, extra_str);
+            }
+        }
+        else {
+            // Генерируем полностью случайный терм
+            int term_length = 1 + rand() % var_count;
+            bool used[26] = {false};
+            
+            for (int v = 0; v < term_length; v++) {
+                int var_idx;
+                do {
+                    var_idx = rand() % var_count;
+                } while (used[var_idx]);
+                used[var_idx] = true;
+                
+                strcat(dnf, (rand() % 2) ? "!" : "");
+                char var_str[2] = {vars[var_idx], '\0'};
+                strcat(dnf, var_str);
+            }
+        }
+        
+        if (t < required_terms - 1) strcat(dnf, "+");
+    }
+
+    free(vars);
     return dnf;
 }
 
@@ -529,15 +559,31 @@ char evaluate_dnf(const char* dnf, const char* inputs) {
         char* p = term;
         
         while (*p) {
+            // Skip whitespace
+            if (*p == ' ') {
+                p++;
+                continue;
+            }
+            
             bool negated = false;
             if (*p == '!') {
                 negated = true;
                 p++;
+                // Skip whitespace after negation
+                while (*p == ' ') p++;
             }
             
             if (isalpha(*p)) {
-                int var_idx = toupper(*p) - 'A';
-                bool var_value = (inputs[var_idx] == '1');
+                char var = toupper(*p);
+                int var_idx = var - 'A';
+                
+                // Default to false if variable not in inputs
+                bool var_value = false;
+                
+                // Check if variable exists in inputs
+                if (var_idx >= 0 && var_idx < strlen(inputs)) {
+                    var_value = (inputs[var_idx] == '1');
+                }
                 
                 if (negated) {
                     var_value = !var_value;
@@ -574,6 +620,7 @@ void test_all_combinations(BDD* bdd, const char* dnf, int var_count) {
     int total_tests = 1 << var_count;
     int passed = 0;
     
+    // Bitmask enumeration
     for (int i = 0; i < total_tests; i++) {
         // Generate binary string
         for (int j = 0; j < var_count; j++) {
@@ -645,6 +692,8 @@ void test_optimized_bdd(const char* dnf) {
 // -------------------- Main --------------------
 int main() {
     srand(time(NULL));
+
+    BDD *bdd = BDD_create_with_best_order("A!B!C+!AB!C+!A!BC");
     
     // Simple test cases
     test_bdd_creation("AB+!AC", "ABC");
@@ -653,12 +702,17 @@ int main() {
     
     // Test optimized creation
     test_optimized_bdd("AB+!AC");
-    test_optimized_bdd("A!B!C+!AB!C+!A!BC");
+    test_optimized_bdd("A+B+C");
+    test_optimized_bdd("A!B+!AB");
+
+    // Test with large DNFs
+    test_bdd_creation("AMBLFG+JDBNHC+!AJ!EC+FIHMNE+KDH!LM+AK!BNG+E!HKAI+GJLNBE+!LDKEG+HGNKFD+FDCGJA+BJM!EA+!NIHMB+EJ!FAG+LGMBCD+BEGFIK+HMLDCG+B!NDHCM", "ABCDEFGHIJKLMN");
+    test_optimized_bdd("AMBLFG+JDBNHC+!AJ!EC+FIHMNE+KDH!LM+AK!BNG+E!HKAI+GJLNBE+!LDKEG+HGNKFD+FDCGJA+BJM!EA+!NIHMB+EJ!FAG+LGMBCD+BEGFIK+HMLDCG+B!NDHCM");
     
     // Generate and test random DNFs
-    for (int i = 0; i < 5; i++) {
-        int var_count = 4 + rand() % 5; // 4-8 variables
-        int term_count = 3 + rand() % 5; // 3-7 terms
+    for (int i = 0; i < 10; i++) {
+        int var_count = 10 + rand() % 5; // 4-8 variables
+        int term_count = 13 + rand() % 5; // 3-7 terms
         
         char* dnf = generate_random_dnf(var_count, term_count);
         
